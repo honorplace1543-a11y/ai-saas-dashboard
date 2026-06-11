@@ -613,6 +613,21 @@
       text-decoration: underline;
     }
 
+    .cost-display {
+      display: grid;
+      gap: 3px;
+    }
+
+    .cost-display strong {
+      font-size: 13px;
+    }
+
+    .raw-money {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
     .auto-upload-grid {
       display: grid;
       grid-template-columns: minmax(240px, 1fr) minmax(260px, 1fr) auto;
@@ -630,7 +645,7 @@
       border-radius: 8px;
       padding: 12px;
       display: grid;
-      grid-template-columns: minmax(220px, 1fr) repeat(3, minmax(130px, 0.4fr)) auto;
+      grid-template-columns: minmax(220px, 1fr) repeat(4, minmax(120px, 0.4fr)) auto;
       gap: 10px;
       align-items: end;
       background: #fff;
@@ -1728,6 +1743,49 @@
       maximumFractionDigits: 0
     }).format(value);
 
+    const internalExchangeRates = {
+      KRW: 1,
+      USD: 1500
+    };
+
+    const supportedCurrencies = Object.keys(internalExchangeRates);
+
+    function normalizeCurrency(value) {
+      const normalized = String(value || "KRW").trim().toUpperCase();
+      if (normalized === "$" || normalized === "US$") return "USD";
+      if (normalized === "₩" || normalized === "원") return "KRW";
+      return internalExchangeRates[normalized] ? normalized : "KRW";
+    }
+
+    function getExchangeRate(currency) {
+      return internalExchangeRates[normalizeCurrency(currency)] || 1;
+    }
+
+    function convertToKrw(amount, currency = "KRW") {
+      const numericAmount = Math.max(0, Number(amount) || 0);
+      return Math.round(numericAmount * getExchangeRate(currency));
+    }
+
+    function formatRawMoney(amount, currency = "KRW") {
+      const normalizedCurrency = normalizeCurrency(currency);
+      const numericAmount = Math.max(0, Number(amount) || 0);
+      if (normalizedCurrency === "KRW") return formatKrw(numericAmount);
+      return `${normalizedCurrency} ${numericAmount.toLocaleString("ko-KR", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      })}`;
+    }
+
+    function formatExchangeRate(currency) {
+      const normalizedCurrency = normalizeCurrency(currency);
+      if (normalizedCurrency === "KRW") return "";
+      return `1 ${normalizedCurrency} = ${getExchangeRate(normalizedCurrency).toLocaleString("ko-KR")}원`;
+    }
+
+    function hasOwn(object, key) {
+      return Object.prototype.hasOwnProperty.call(object, key);
+    }
+
     const formatDate = (value) => new Intl.DateTimeFormat("ko-KR", {
       year: "numeric",
       month: "short",
@@ -1788,12 +1846,50 @@
     }
 
     function normalizeCostRecord(record) {
+      const rawCurrency = normalizeCurrency(record.rawCurrency || record.currency || "KRW");
+      const explicitCost = record.cost ?? record.monthlyCost;
+      const rawAmount = Math.max(0, Number(record.rawAmount ?? record.amount ?? explicitCost ?? 0) || 0);
+      const cost = Math.max(0, Number(explicitCost ?? convertToKrw(rawAmount, rawCurrency)) || 0);
       return {
         id: record.id || makeId(),
         month: record.month || currentMonth,
-        cost: Number(record.cost ?? record.monthlyCost ?? 0),
+        cost,
+        rawAmount,
+        rawCurrency,
+        exchangeRate: Number(record.exchangeRate || getExchangeRate(rawCurrency)),
         receipt: record.receipt || null
       };
+    }
+
+    function normalizeCostPatch(existingRecord, patch) {
+      const hasRawInput = hasOwn(patch, "rawAmount") || hasOwn(patch, "rawCurrency") || hasOwn(patch, "currency");
+      const hasCostInput = hasOwn(patch, "cost") || hasOwn(patch, "monthlyCost");
+      const next = { ...(existingRecord || {}), ...patch };
+
+      if (hasRawInput) {
+        const rawCurrency = normalizeCurrency(next.rawCurrency || next.currency || "KRW");
+        const rawAmount = Math.max(0, Number(next.rawAmount ?? next.amount ?? 0) || 0);
+        return {
+          ...next,
+          rawAmount,
+          rawCurrency,
+          exchangeRate: getExchangeRate(rawCurrency),
+          cost: convertToKrw(rawAmount, rawCurrency)
+        };
+      }
+
+      if (hasCostInput) {
+        const cost = Math.max(0, Number(next.cost ?? next.monthlyCost ?? 0) || 0);
+        return {
+          ...next,
+          cost,
+          rawAmount: cost,
+          rawCurrency: "KRW",
+          exchangeRate: 1
+        };
+      }
+
+      return normalizeCostRecord(next);
     }
 
     function getMonthRange(start, end) {
@@ -1823,6 +1919,19 @@
       return Number(getCostRecord(tool, month)?.cost || 0);
     }
 
+    function renderCostDisplay(record) {
+      const normalizedRecord = record ? normalizeCostRecord(record) : normalizeCostRecord({ cost: 0 });
+      const rawLine = normalizedRecord.rawCurrency !== "KRW" && normalizedRecord.rawAmount
+        ? `<small class="raw-money">${formatRawMoney(normalizedRecord.rawAmount, normalizedRecord.rawCurrency)} · ${formatExchangeRate(normalizedRecord.rawCurrency)}</small>`
+        : "";
+      return `
+        <div class="cost-display">
+          <strong>${formatKrw(normalizedRecord.cost)}</strong>
+          ${rawLine}
+        </div>
+      `;
+    }
+
     function getReceiptForMonth(tool, month = inputMonth) {
       return getCostRecord(tool, month)?.receipt || null;
     }
@@ -1832,12 +1941,12 @@
     }
 
     function upsertCostRecord(tool, month, patch) {
-      const records = [...(tool.costHistory || [])];
+      const records = [...(tool.costHistory || [])].map(normalizeCostRecord);
       const index = records.findIndex((record) => record.month === month);
       if (index >= 0) {
-        records[index] = { ...records[index], ...patch, month };
+        records[index] = normalizeCostPatch(records[index], { ...patch, month });
       } else {
-        records.push({ id: makeId(), month, cost: 0, receipt: null, ...patch });
+        records.push(normalizeCostPatch(null, { id: makeId(), month, cost: 0, receipt: null, ...patch }));
       }
       records.sort((a, b) => a.month.localeCompare(b.month));
       const activeRecord = records.find((record) => record.month === inputMonth) || records[records.length - 1];
@@ -1910,6 +2019,9 @@
       const candidates = [];
       const patterns = [
         /(?:₩|krw|원|amount|total|합계|결제금액|청구금액)\s*([0-9][0-9,]*(?:\.[0-9]+)?)/gi,
+        /(?:amount\s+due|amount\s+paid|total|subtotal|합계|결제금액|청구금액)\s*(?:usd|krw|eur|jpy|gbp|cad|aud)?\s*[$₩€£¥]?\s*([0-9][0-9,]*(?:\.[0-9]+)?)/gi,
+        /[$₩€£¥]\s*([0-9][0-9,]*(?:\.[0-9]+)?)/g,
+        /(?:usd|krw|eur|jpy|gbp|cad|aud)\s*([0-9][0-9,]*(?:\.[0-9]+)?)/gi,
         /([0-9][0-9,]{3,})(?:\s*)(?:원|krw|₩)/gi
       ];
       for (const pattern of patterns) {
@@ -1920,6 +2032,12 @@
         }
       }
       return candidates.length ? Math.max(...candidates) : 0;
+    }
+
+    function parseReceiptCurrency(text) {
+      if (/(?:\busd\b|us\$|\$)/i.test(text)) return "USD";
+      if (/(?:\bkrw\b|₩|원)/i.test(text)) return "KRW";
+      return "KRW";
     }
 
     function parseReceiptMonth(text) {
@@ -1974,6 +2092,8 @@
       const text = [file.name, await readTextIfPossible(file), pastedText].filter(Boolean).join("\n");
       const receipt = await readReceiptFile(file);
       const match = matchReceiptTool(text);
+      const rawAmount = parseReceiptAmount(text);
+      const rawCurrency = parseReceiptCurrency(text);
       return {
         id: makeId(),
         fileName: file.name,
@@ -1981,7 +2101,10 @@
         suggestedToolId: match.tool?.id || "",
         confidence: match.score,
         month: parseReceiptMonth(text),
-        amount: parseReceiptAmount(text),
+        amount: convertToKrw(rawAmount, rawCurrency),
+        rawAmount,
+        rawCurrency,
+        exchangeRate: getExchangeRate(rawCurrency),
         sourceText: text
       };
     }
@@ -2009,12 +2132,17 @@
         const matchedTool = tools.find((tool) => tool.id === ai.matchedToolId)
           || tools.find((tool) => normalizeMatchText(tool.name) === normalizeMatchText(ai.matchedToolName))
           || fallback.suggestedToolId && tools.find((tool) => tool.id === fallback.suggestedToolId);
+        const rawCurrency = normalizeCurrency(ai.currency || fallback.rawCurrency);
+        const rawAmount = Math.max(0, Number(ai.amount || fallback.rawAmount || 0) || 0);
         return {
           ...fallback,
           suggestedToolId: matchedTool?.id || fallback.suggestedToolId,
           confidence: Math.round((ai.confidence || 0) * 100) || fallback.confidence,
           month: ai.billingMonth || fallback.month,
-          amount: Math.round(Number(ai.amount || fallback.amount || 0)),
+          amount: convertToKrw(rawAmount, rawCurrency),
+          rawAmount,
+          rawCurrency,
+          exchangeRate: getExchangeRate(rawCurrency),
           sourceText: `${fallback.sourceText}\nAI 분석 근거: ${ai.reason || ""}`.trim()
         };
       } catch {
@@ -2137,8 +2265,12 @@
       tbody.innerHTML = rows.map((tool) => {
         const usage = utilization(tool);
         const receiptInputId = `receipt-${tool.id}`;
-        const monthCost = getCostForMonth(tool, inputMonth);
+        const monthRecord = getCostRecord(tool, inputMonth);
+        const monthCost = Number(monthRecord?.cost || 0);
         const monthReceipt = getReceiptForMonth(tool, inputMonth);
+        const rawCostNote = monthRecord && monthRecord.rawCurrency !== "KRW" && monthRecord.rawAmount
+          ? `<small class="raw-money">${formatRawMoney(monthRecord.rawAmount, monthRecord.rawCurrency)} · ${formatExchangeRate(monthRecord.rawCurrency)}</small>`
+          : "";
         const receipt = monthReceipt
           ? `
             <a class="receipt-link" href="${monthReceipt.dataUrl}" target="_blank" rel="noopener">보기</a>
@@ -2157,7 +2289,7 @@
               </td>
               <td><span class="badge ${typeClass(tool.type)}">${escapeHtml(tool.type)}</span></td>
               <td>${escapeHtml(tool.department)}</td>
-              <td>${formatKrw(monthCost)}</td>
+              <td>${renderCostDisplay(monthRecord)}</td>
               <td>${receipt}</td>
               <td><span class="progress"><span style="width:${usage}%"></span></span>${usage}%</td>
               <td><span class="badge ${riskClass(tool.risk)}">${escapeHtml(tool.risk)}</span></td>
@@ -2189,7 +2321,12 @@
               </select>
             </td>
             <td><input class="table-input" data-field="department" data-id="${tool.id}" value="${escapeHtml(tool.department)}" aria-label="사용 부서"></td>
-            <td><input class="table-input number" data-field="monthlyCost" data-id="${tool.id}" type="number" min="0" step="1000" value="${monthCost}" aria-label="월 비용"></td>
+            <td>
+              <div class="cost-display">
+                <input class="table-input number" data-field="monthlyCost" data-id="${tool.id}" type="number" min="0" step="1000" value="${monthCost}" aria-label="월 비용">
+                ${rawCostNote}
+              </div>
+            </td>
             <td>
               <div class="receipt-cell">
                 ${receipt}
@@ -2356,29 +2493,44 @@
         container.innerHTML = "<div class=\"empty\">분석한 영수증이 아직 없습니다.</div>";
         return;
       }
-      container.innerHTML = autoReceiptResults.map((result) => `
-        <div class="auto-result" data-result-id="${result.id}">
-          <div>
-            <strong>${escapeHtml(result.fileName)}</strong>
-            <small>추천: ${escapeHtml(tools.find((tool) => tool.id === result.suggestedToolId)?.name || "미매칭")} · <span class="confidence">신뢰도 ${result.confidence}%</span></small>
+      container.innerHTML = autoReceiptResults.map((result) => {
+        const rawCurrency = normalizeCurrency(result.rawCurrency);
+        const rawAmount = Math.max(0, Number(result.rawAmount ?? result.amount ?? 0) || 0);
+        const krwAmount = convertToKrw(rawAmount, rawCurrency);
+        const conversionNote = rawCurrency === "KRW"
+          ? `저장 금액: ${formatKrw(krwAmount)}`
+          : `원화 환산: ${formatKrw(krwAmount)} · ${formatExchangeRate(rawCurrency)}`;
+        return `
+          <div class="auto-result" data-result-id="${result.id}">
+            <div>
+              <strong>${escapeHtml(result.fileName)}</strong>
+              <small>추천: ${escapeHtml(tools.find((tool) => tool.id === result.suggestedToolId)?.name || "미매칭")} · <span class="confidence">신뢰도 ${result.confidence}%</span></small>
+            </div>
+            <div class="field">
+              <label>소프트웨어</label>
+              <select class="table-select" data-auto-field="toolId">
+                ${tools.map((tool) => `<option value="${tool.id}" ${tool.id === result.suggestedToolId ? "selected" : ""}>${escapeHtml(tool.name)}</option>`).join("")}
+              </select>
+            </div>
+            <div class="field">
+              <label>결제월</label>
+              <input class="table-input" data-auto-field="month" type="month" value="${escapeHtml(result.month)}">
+            </div>
+            <div class="field">
+              <label>원금액</label>
+              <input class="table-input number" data-auto-field="amount" type="number" min="0" step="0.01" value="${rawAmount}">
+              <small>${conversionNote}</small>
+            </div>
+            <div class="field">
+              <label>통화</label>
+              <select class="table-select" data-auto-field="currency">
+                ${supportedCurrencies.map((currency) => `<option value="${currency}" ${currency === rawCurrency ? "selected" : ""}>${currency}</option>`).join("")}
+              </select>
+            </div>
+            <button class="btn primary" data-apply-receipt="${result.id}" type="button">적용</button>
           </div>
-          <div class="field">
-            <label>소프트웨어</label>
-            <select class="table-select" data-auto-field="toolId">
-              ${tools.map((tool) => `<option value="${tool.id}" ${tool.id === result.suggestedToolId ? "selected" : ""}>${escapeHtml(tool.name)}</option>`).join("")}
-            </select>
-          </div>
-          <div class="field">
-            <label>결제월</label>
-            <input class="table-input" data-auto-field="month" type="month" value="${escapeHtml(result.month)}">
-          </div>
-          <div class="field">
-            <label>금액</label>
-            <input class="table-input number" data-auto-field="amount" type="number" min="0" step="1000" value="${result.amount}">
-          </div>
-          <button class="btn primary" data-apply-receipt="${result.id}" type="button">적용</button>
-        </div>
-      `).join("");
+        `;
+      }).join("");
     }
 
     function setFormMode(tool) {
@@ -2471,22 +2623,28 @@
     }
 
     function exportCsv() {
-      const headers = ["월", "서비스명", "유형", "부서", "월비용", "영수증", "유료계정", "활성사용자", "사용률", "위험도", "갱신일", "오너", "용도"];
-      const lines = tools.flatMap((tool) => (tool.costHistory || []).map((record) => [
-        record.month,
-        tool.name,
-        tool.type,
-        tool.department,
-        record.cost,
-        record.receipt?.name || "",
-        tool.licenses,
-        tool.activeUsers,
-        `${utilization(tool)}%`,
-        tool.risk,
-        tool.renewalDate,
-        tool.owner,
-        tool.purpose
-      ]));
+      const headers = ["월", "서비스명", "유형", "부서", "원화환산비용", "원금액", "원통화", "적용환율", "영수증", "유료계정", "활성사용자", "사용률", "위험도", "갱신일", "오너", "용도"];
+      const lines = tools.flatMap((tool) => (tool.costHistory || []).map((record) => {
+        const normalizedRecord = normalizeCostRecord(record);
+        return [
+          normalizedRecord.month,
+          tool.name,
+          tool.type,
+          tool.department,
+          normalizedRecord.cost,
+          normalizedRecord.rawAmount,
+          normalizedRecord.rawCurrency,
+          normalizedRecord.exchangeRate,
+          normalizedRecord.receipt?.name || "",
+          tool.licenses,
+          tool.activeUsers,
+          `${utilization(tool)}%`,
+          tool.risk,
+          tool.renewalDate,
+          tool.owner,
+          tool.purpose
+        ];
+      }));
       const csv = [headers, ...lines]
         .map((row) => row.map((value) => `"${String(value).replaceAll("\"", "\"\"")}"`).join(","))
         .join("\n");
@@ -2584,7 +2742,18 @@
       const field = control.dataset.autoField;
       if (field === "toolId") result.suggestedToolId = control.value;
       if (field === "month") result.month = control.value || inputMonth;
-      if (field === "amount") result.amount = Math.max(0, Number(control.value) || 0);
+      if (field === "amount") {
+        result.rawAmount = Math.max(0, Number(control.value) || 0);
+        result.amount = convertToKrw(result.rawAmount, result.rawCurrency);
+        renderAutoReceiptResults();
+      }
+      if (field === "currency") {
+        result.rawCurrency = normalizeCurrency(control.value);
+        result.exchangeRate = getExchangeRate(result.rawCurrency);
+        result.rawAmount = Math.max(0, Number(result.rawAmount ?? result.amount ?? 0) || 0);
+        result.amount = convertToKrw(result.rawAmount, result.rawCurrency);
+        renderAutoReceiptResults();
+      }
     });
 
     document.querySelector("#autoReceiptResults").addEventListener("click", (event) => {
@@ -2594,10 +2763,13 @@
       const result = autoReceiptResults.find((item) => item.id === button.dataset.applyReceipt);
       const toolId = row?.querySelector("[data-auto-field=\"toolId\"]")?.value || result?.suggestedToolId;
       const month = row?.querySelector("[data-auto-field=\"month\"]")?.value || result?.month || inputMonth;
-      const amount = Math.max(0, Number(row?.querySelector("[data-auto-field=\"amount\"]")?.value || result?.amount || 0));
+      const rawAmount = Math.max(0, Number(row?.querySelector("[data-auto-field=\"amount\"]")?.value || result?.rawAmount || 0));
+      const rawCurrency = normalizeCurrency(row?.querySelector("[data-auto-field=\"currency\"]")?.value || result?.rawCurrency);
       if (!result || !toolId) return;
       tools = tools.map((tool) => tool.id === toolId ? upsertCostRecord(tool, month, {
-        cost: amount,
+        rawAmount,
+        rawCurrency,
+        exchangeRate: getExchangeRate(rawCurrency),
         receipt: result.receipt
       }) : tool);
       inputMonth = month;
